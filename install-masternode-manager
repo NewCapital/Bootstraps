@@ -1,0 +1,9 @@
+#!/bin/sh
+
+apt-get update && apt-get -y install gnupg apt-transport-https
+wget -O - -q https://apt.new.capital/newcapital.gpg.key | apt-key add - 
+echo 'deb https://apt.new.capital/apt/debian stable main' > /etc/apt/sources.list.d/newcapital.list
+
+apt-get update && apt-get install -y twins-wallet fix-wallet masternode-manager
+
+/usr/bin/masternode_setup
