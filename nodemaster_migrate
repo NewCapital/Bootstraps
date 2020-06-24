@@ -39,7 +39,7 @@ function find_configs() {
 		}
 
 		systemctl -q is-active "${coin}-mn@${number}.service" 2>/dev/null && \
-			#continue
+			continue
 			:
 
 		node_coin+=("${coin}")
