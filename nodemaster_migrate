@@ -1,0 +1,243 @@
+#!/bin/bash
+
+DRY_RUN=""
+#DRY_RUN="echo ======== "
+
+ETC_CONF=/etc/masternodes
+LIB_MN=/var/lib/masternodes
+SRV_DIR=/etc/systemd/system
+
+NODEMASTER_HELPER=/usr/local/bin/activate_masternodes
+
+OLD_BINS="twinsd twins-cli fixd fix-cli"
+
+node_coin=()
+node_num=()
+isactive=()
+isenabled=()
+
+shopt -s nullglob
+
+function abort() {
+	echo -e "\n${1}\n" >&2
+	exit 1
+}
+
+function find_configs() {
+	y=1
+	for i in ${ETC_CONF}/{twins,fix}_n*.conf
+	do
+		fname=${i##*/}
+		coin=${fname%%_*}
+		number=${i##*_n}
+		number=${number%%.conf}
+
+		[[ "${coin}" != "twins" ]] && 
+			[[ "${coin}" != "fix" ]] &&  {
+			continue
+			# abort "Error: unknown file/coin config ${i}.\n		We can migrate only TWINS and FIX"
+		}
+
+		systemctl -q is-active "${coin}-mn@${number}.service" 2>/dev/null && \
+			#continue
+			:
+
+		node_coin+=("${coin}")
+		node_num+=("${number}")
+		systemctl -q is-active "${coin}_n${number}.service" 2>/dev/null
+		isactive+=("$?")
+		systemctl -q is-enabled "${coin}_n${number}.service" 2>/dev/null
+		isenabled+=("$?")
+		y+=$((y+1))
+	done
+}
+
+function stop_all() {
+	ret=0
+
+	local i
+	echo -e "\nStopping nodemaster services..."
+	for (( i=0; i < ${#node_coin[@]}; i++ ))
+	do
+		echo -n "	Stopping ${node_coin[${i}]}_n${node_num[${i}]}.service..."
+		do_task "systemctl -q stop ${node_coin[${i}]}_n${node_num[${i}]}.service"
+		[[ $? -ne 0 ]] && [[ ${isactive[${i}]} -eq 0 ]] && {
+			ret=1
+			abort "ERROR. Can't stop ${node_coin[${i}]}_n${node_num[${i}]}.service"
+		}
+	done
+	return ${ret}
+}
+
+
+function check_requirements() {
+	:
+}
+
+function is_mn_valid() {
+	is_valid=1
+
+	echo "[[ -d ${LIB_MN}/${node_coin["$1"]}${node_num["$1"]} ]] && "
+	[[ -d ${LIB_MN}/${node_coin["$1"]}${node_num["$1"]} ]] && \
+		echo yes || echo no
+}
+
+function mn_info() {
+	n=${1-0}
+
+	config_file=${ETC_CONF}/${node_coin[${n}]}_n${node_num[${n}]}.conf
+	data_dir=${LIB_MN}/${node_coin[${n}]}${node_num[${n}]}
+	service_file=${SRV_DIR}/${node_coin[${n}]}_n${node_num[${n}]}.service
+
+	[[ -f ${config_file} ]] && \
+		[[ -d ${data_dir} ]] && \
+			[[ -f ${service_file} ]] && {
+				service_name=${node_coin[${n}]}_n${node_num[${n}]}.service
+				echo  ok...
+				echo config: $(ls ${ETC_CONF}/${node_coin[${n}]}_n${node_num[${n}]}.conf)
+				echo ${service_file}
+				echo Service is ${isactive[$n]}
+		} || {
+			echo "Broken masternode installation for ${config_file}"
+		}
+}
+
+function disable_old {
+	local n=${1}
+
+	[[ $n -ge 0 ]] && {
+		old_srvname=${node_coin[${n}]}_n${node_num[${n}]}.service
+		echo -e "\nDisabling ${old_srvname}..."
+
+		${DRY_RUN} systemctl -q stop ${old_srvname} 2>/dev/null
+		${DRY_RUN} systemctl -q disable ${old_srvname} 2>/dev/null
+		${DRY_RUN} rm -f ${SRV_DIR}/${old_srvname}
+		${DRY_RUN} systemctl daemon-reload
+	}
+}
+
+function enable_new {
+	local n=${1}
+
+	[[ $n -ge 0 ]] && {
+		srvname=${node_coin[${n}]}-mn@${node_num[${n}]}
+		echo "Enabling ${srvname}..."
+
+		${DRY_RUN} systemctl -q enable "${srvname}"
+		${DRY_RUN} systemctl -q start "${srvname}"
+	}
+}
+
+
+function delete_old_files() {
+	echo -e "\nRemooving old files..."
+	${DRY_RUN} rm -f ${SRV_DIR}/{twins,fix}_n[0-9]*.service
+	${DRY_RUN} rm -f /usr/local/bin/{twins-cli,twinsd,twins-tx,fixd,fix-cli,fix-tx}
+	${DRY_RUN} rm -f /usr/local/bin/activate_masternodes_{twins,fix}
+	${DRY_RUN} systemctl daemon-reload
+}
+
+function check_dir() {
+	for i in  ${LIB_MN}/*
+	do
+		fname=${i##*/}
+		coin=$( echo ${fname} | sed 's/[0-9]\{1,2\}$//g' )
+		srv_num=$( echo ${fname} | sed 's/^[a-zA-Z]*//g' )
+
+		[[ ! -f ${ETC_CONF}/${coin}_n${srv_num}.conf ]] && {
+			echo "Foudn ${fname} which dont'a have proper config"
+		}
+		echo Coin: "${coin} - ${srv_num}: $(systemctl is-active "${coin}_n${srv_num}.service")"
+	done
+}
+
+function spin_it() {
+	local pid=$1
+
+	spin='-\|/'
+	local i=0
+
+	echo -n '   '
+	while kill -0 $pid 2>/dev/null
+	do
+		i=$(( (i+1) %4 ))
+		printf "\b\b\b[${spin:$i:1}]"
+		sleep .1
+	done
+	printf "\b\b\b   \b\b\b\n"
+}
+
+function do_task() {
+	${DRY_RUN} ${@} >/dev/null 2>&1 &
+	pid=$!
+	spin_it ${pid}
+	wait  ${pid}
+	return $?
+}
+
+function install_packages() {
+	echo -n -e "\nUpdating packages..."
+	do_task "apt-get -qq update" && \
+		echo -n -e "\nInstalling dependencies..." &&
+		do_task "apt-get -qq -y install gnupg apt-transport-https"
+	[[ $? -ne 0 ]] && abort "Can't install required packages"
+	echo -n -e "\nAdding NewCapital repository key..."
+	wget -O - -q https://apt.new.capital/newcapital.gpg.key | apt-key add -
+	echo 'deb https://apt.new.capital/apt/debian stable main' > /etc/apt/sources.list.d/newcapital.list
+	echo -n -e "\nUpdating packages..."
+	do_task "apt-get -qq update" && \
+		echo -n -e "\nInstalling masternode-manager..." &&
+		do_task "apt-get install -qq -y twins-wallet fix-wallet masternode-manager"
+	return $?
+}
+
+check_requirements
+
+find_configs
+
+detected_coins=($(echo "${node_coin[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+
+[[ ${#node_coin[@]} -lt 1 ]] && {
+	abort "Nothing to migrate..."
+}
+
+install_packages || abort "Can't install required packages"
+
+stop_all || abort "Can't stop services"
+
+for (( i=0; i < ${#node_coin[@]}; i++ ))
+do
+	disable_old ${i}
+	enable_new ${i}
+done
+
+[[ ! -f /etc/masternodes.conf ]] && \
+	echo -e "\nEnabling autoupdate..."
+	echo "autoupdate=yes" > /etc/masternodes.conf
+
+delete_old_files
+
+res=0
+act=0
+for (( i=0; i < ${#node_coin[@]}; i++ ))
+do
+	coin=${node_coin[${i}]}
+	num=${node_num[${i}]}
+	srvname=${node_coin[${n}]}-mn@${node_num[${n}]}
+	# ${coin}-cli -conf=${ETC_CONF}/${coin}_n${num}.conf masternode status || act=1
+	systemctl -q is-active ${srvname} 2>&1 || res=1
+done
+
+echo -e "\n====================================\n"
+[[ ${res} -eq 0 ]] && {
+	echo "All masternode services were started succesfully"
+} || {
+	abort "Something went wrong... Please check services manually"
+}
+
+#[[ ${act} -eq 0 ]] && {
+#	echo "All masternodes are ready"
+#} || {
+#	abort "Some masternodes are NOT ready yet.  Please check 'masternode status' manually in a few minutes !"
+#}
+exit
